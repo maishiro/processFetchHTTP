@@ -41,10 +41,10 @@ func main() {
 
 	// LOG configuration
 	log.SetOutput(&lumberjack.Logger{
-		Filename:   cfg.Cfg.LogFilePath,
-		MaxSize:    cfg.Cfg.LogFileMaxSize,
-		MaxBackups: cfg.Cfg.LogFileMaxBackup,
-		MaxAge:     cfg.Cfg.LogFileMaxAge,
+		Filename:   cfg.Setting.LogFilePath,
+		MaxSize:    cfg.Setting.LogFileMaxSize,
+		MaxBackups: cfg.Setting.LogFileMaxBackup,
+		MaxAge:     cfg.Setting.LogFileMaxAge,
 		Compress:   false,
 	})
 

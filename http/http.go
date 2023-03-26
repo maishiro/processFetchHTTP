@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -20,22 +22,35 @@ import (
 	"github.com/influxdata/toml/ast"
 
 	httpconfig "github.com/influxdata/telegraf/plugins/common/http"
-	"github.com/influxdata/telegraf/plugins/inputs"
 	"github.com/influxdata/telegraf/plugins/parsers"
 	"github.com/influxdata/telegraf/plugins/parsers/csv"
 	_ "github.com/influxdata/telegraf/plugins/parsers/xpath"
 	"github.com/influxdata/telegraf/plugins/processors"
+	"github.com/influxdata/telegraf/plugins/serializers"
+)
+
+var (
+	// envVarRe is a regex to find environment variables in the config file
+	envVarRe = regexp.MustCompile(`\${(\w+)}|\$(\w+)`)
+
+	envVarEscaper = strings.NewReplacer(
+		`"`, `\"`,
+		`\`, `\\`,
+	)
+	// httpLoadConfigRetryInterval = 10 * time.Second
+
+	// // fetchURLRe is a regex to determine whether the requested file should
+	// // be fetched from a remote or read from the filesystem.
+	// fetchURLRe = regexp.MustCompile(`^\w+://`)
+
+	// // Password specified via command-line
+	// Password Secret
 )
 
 //go:embed sample.conf
 var sampleConfig string
 
 type HTTP struct {
-	LogFilePath      string `toml:"logfile_path"`
-	LogFileMaxSize   int    `toml:"logfile_maxsize"`
-	LogFileMaxBackup int    `toml:"logfile_maxbackup"`
-	LogFileMaxAge    int    `toml:"logfile_maxage"`
-
 	URLs            []string `toml:"urls"`
 	Method          string   `toml:"method"`
 	Body            string   `toml:"body"`
@@ -57,12 +72,16 @@ type HTTP struct {
 	Log telegraf.Logger `toml:"-"`
 
 	UnusedFields map[string]bool
+	unusedFieldsMutex *sync.Mutex
 	Toml         *toml.Config
 	errs         []error // config load errors.
 
 	httpconfig.HTTPClientConfig
+	serializerConfig *serializers.Config
+	serializer       serializers.Serializer
 
 	client     *http.Client
+	parser           telegraf.Parser
 	parserFunc telegraf.ParserFunc
 }
 
@@ -72,6 +91,7 @@ func (*HTTP) SampleConfig() string {
 
 func (h *HTTP) Init() error {
 	h.UnusedFields = map[string]bool{}
+	h.unusedFieldsMutex = &sync.Mutex{}
 
 	ctx := context.Background()
 	client, err := h.HTTPClientConfig.CreateClient(ctx, h.Log)
@@ -125,7 +145,7 @@ func (c *HTTP) LoadConfigData(data []byte) error {
 	// 		return fmt.Errorf("error parsing [agent]: %w", err)
 	// 	}
 	// }
-
+	
 	// if !c.Agent.OmitHostname {
 	// 	if c.Agent.Hostname == "" {
 	// 		hostname, err := os.Hostname()
@@ -221,6 +241,10 @@ func (c *HTTP) LoadConfigData(data []byte) error {
 		case "processors":
 			for pluginName, pluginVal := range subTable.Fields {
 				switch pluginSubTable := pluginVal.(type) {
+				case *ast.Table:
+					if err = c.addProcessor(pluginName, pluginSubTable); err != nil {
+						return fmt.Errorf("error parsing %s, %w", pluginName, err)
+					}
 				case []*ast.Table:
 					for _, t := range pluginSubTable {
 						if err = c.addProcessor(pluginName, t); err != nil {
@@ -307,33 +331,29 @@ func (c *HTTP) LoadConfigData(data []byte) error {
 func (h *HTTP) ParseConfig(contents []byte) (*ast.Table, error) {
 	contents = trimBOM(contents)
 
-	// parameters := envVarRe.FindAllSubmatch(contents, -1)
-	// for _, parameter := range parameters {
-	// 	if len(parameter) != 3 {
-	// 		continue
-	// 	}
+	parameters := envVarRe.FindAllSubmatch(contents, -1)
+	for _, parameter := range parameters {
+		if len(parameter) != 3 {
+			continue
+		}
 
-	// 	var envVar []byte
-	// 	if parameter[1] != nil {
-	// 		envVar = parameter[1]
-	// 	} else if parameter[2] != nil {
-	// 		envVar = parameter[2]
-	// 	} else {
-	// 		continue
-	// 	}
+		var envVar []byte
+		if parameter[1] != nil {
+			envVar = parameter[1]
+		} else if parameter[2] != nil {
+			envVar = parameter[2]
+		} else {
+			continue
+		}
 
-	// 	envVal, ok := os.LookupEnv(strings.TrimPrefix(string(envVar), "$"))
-	// 	if ok {
-	// 		envVal = escapeEnv(envVal)
-	// 		contents = bytes.Replace(contents, parameter[0], []byte(envVal), 1)
-	// 	}
-	// }
+		envVal, ok := os.LookupEnv(strings.TrimPrefix(string(envVar), "$"))
+		if ok {
+			envVal = escapeEnv(envVal)
+			contents = bytes.Replace(contents, parameter[0], []byte(envVal), 1)
+		}
+	}
 
 	return toml.Parse(contents)
-}
-
-func trimBOM(f []byte) []byte {
-	return bytes.TrimPrefix(f, []byte("\xef\xbb\xbf"))
 }
 
 func (c *HTTP) addProcessor(name string, table *ast.Table) error {
@@ -347,16 +367,22 @@ func (c *HTTP) addProcessor(name string, table *ast.Table) error {
 		return fmt.Errorf("undefined but requested processor: %s", name)
 	}
 
+	var method string
+	c.getFieldString(table, "method", &method)
+	var body string
+	c.getFieldString(table, "body", &body)
+
+
 	// For processors with parsers we need to compute the set of
 	// options that is not covered by both, the parser and the processor.
 	// We achieve this by keeping a local book of missing entries
 	// that counts the number of misses. In case we have a parser
 	// for the input both need to miss the entry. We count the
 	// missing entries at the end.
-	// missCount := make(map[string]int)
-	// missCountThreshold := 0
-	// c.setLocalMissingTomlFieldTracker(missCount)
-	// defer c.resetMissingTomlFieldTracker()
+	missCount := make(map[string]int)
+	missCountThreshold := 0
+	c.setLocalMissingTomlFieldTracker(missCount)
+	defer c.resetMissingTomlFieldTracker()
 
 	// Setup the processor running before the aggregators
 	processorBeforeConfig, err := c.buildProcessor("processors", name, table)
@@ -364,14 +390,14 @@ func (c *HTTP) addProcessor(name string, table *ast.Table) error {
 		return err
 	}
 	// processorBefore, hasParser, err := c.setupProcessor(processorBeforeConfig.Name, creator, table)
-	_, _, err = c.setupProcessor(processorBeforeConfig.Name, creator, table)
+	_, hasParser, err := c.setupProcessor(processorBeforeConfig.Name, creator, table)
 	if err != nil {
 		return err
 	}
 	// rf := models.NewRunningProcessor(processorBefore, processorBeforeConfig)
 	// c.fileProcessors = append(c.fileProcessors, &OrderedPlugin{table.Line, rf})
 
-	// // Setup another (new) processor instance running after the aggregator
+	// Setup another (new) processor instance running after the aggregator
 	processorAfterConfig, err := c.buildProcessor("aggprocessors", name, table)
 	if err != nil {
 		return err
@@ -384,18 +410,25 @@ func (c *HTTP) addProcessor(name string, table *ast.Table) error {
 	// rf = models.NewRunningProcessor(processorAfter, processorAfterConfig)
 	// c.fileAggProcessors = append(c.fileAggProcessors, &OrderedPlugin{table.Line, rf})
 
-	// // Check the number of misses against the threshold
-	// if hasParser {
-	// 	missCountThreshold = 2
-	// }
-	// for key, count := range missCount {
-	// 	if count <= missCountThreshold {
-	// 		continue
-	// 	}
-	// 	if err := c.missingTomlField(nil, key); err != nil {
-	// 		return err
-	// 	}
-	// }
+	// input := creator()
+	// if err := c.Toml.UnmarshalTable(table, input); err != nil {
+	if err := c.Toml.UnmarshalTable(table, c); err != nil {
+		return err
+	}
+	
+	
+	// Check the number of misses against the threshold
+	if hasParser {
+		missCountThreshold = 2
+	}
+	for key, count := range missCount {
+		if count <= missCountThreshold {
+			continue
+		}
+		if err := c.missingTomlField(nil, key); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
@@ -406,8 +439,8 @@ func (c *HTTP) addProcessor(name string, table *ast.Table) error {
 func (c *HTTP) buildProcessor(category, name string, tbl *ast.Table) (*models.ProcessorConfig, error) {
 	conf := &models.ProcessorConfig{Name: name}
 
-	// c.getFieldInt64(tbl, "order", &conf.Order)
-	// c.getFieldString(tbl, "alias", &conf.Alias)
+	c.getFieldInt64(tbl, "order", &conf.Order)
+	c.getFieldString(tbl, "alias", &conf.Alias)
 
 	// if c.hasErrs() {
 	// 	return nil, c.firstErr()
@@ -421,6 +454,7 @@ func (c *HTTP) buildProcessor(category, name string, tbl *ast.Table) (*models.Pr
 
 	// // Generate an ID for the plugin
 	// conf.ID, err = generatePluginID(category+"."+name, tbl)
+	conf.ID, err = GeneratePluginID(category+"."+name, tbl)
 	return conf, err
 }
 
@@ -549,6 +583,10 @@ func (h *HTTP) SetParserFunc(fn telegraf.ParserFunc) {
 	h.parserFunc = fn
 }
 
+func (e *HTTP) SetParser(p telegraf.Parser) {
+	e.parser = p
+}
+
 func setDefaultParser(category string, name string) string {
 	// Legacy support, exec plugin originally parsed JSON by default.
 	if category == "inputs" && name == "exec" {
@@ -602,8 +640,7 @@ func (c *HTTP) AddParser(parentcategory, parentname string, table *ast.Table) (*
 // models.ParserConfig to be inserted into models.RunningParser
 func (c *HTTP) buildParser(name string, tbl *ast.Table) *models.ParserConfig {
 	var dataFormat string
-	// c.getFieldString(tbl, "data_format", &dataFormat)
-	dataFormat = c.DataFormat
+	c.getFieldString(tbl, "data_format", &dataFormat)
 
 	conf := &models.ParserConfig{
 		Parent:     name,
@@ -613,11 +650,60 @@ func (c *HTTP) buildParser(name string, tbl *ast.Table) *models.ParserConfig {
 	return conf
 }
 
+func (c *HTTP) setLocalMissingTomlFieldTracker(counter map[string]int) {
+	f := func(t reflect.Type, key string) error {
+		// Check if we are in a root element that might share options among
+		// each other. Those root elements are plugins of all types.
+		// All other elements are subtables of their respective plugin and
+		// should just be hit once anyway. Therefore, we mark them with a
+		// high number to handle them correctly later.
+		pt := reflect.PtrTo(t)
+		root := pt.Implements(reflect.TypeOf((*telegraf.Input)(nil)).Elem())
+		root = root || pt.Implements(reflect.TypeOf((*telegraf.ServiceInput)(nil)).Elem())
+		root = root || pt.Implements(reflect.TypeOf((*telegraf.Output)(nil)).Elem())
+		root = root || pt.Implements(reflect.TypeOf((*telegraf.Aggregator)(nil)).Elem())
+		root = root || pt.Implements(reflect.TypeOf((*telegraf.Processor)(nil)).Elem())
+		root = root || pt.Implements(reflect.TypeOf((*telegraf.Parser)(nil)).Elem())
+
+		c, ok := counter[key]
+		if !root {
+			counter[key] = 100
+		} else if !ok {
+			counter[key] = 1
+		} else {
+			counter[key] = c + 1
+		}
+		return nil
+	}
+	c.Toml.MissingField = f
+}
+
+func (c *HTTP) resetMissingTomlFieldTracker() {
+	c.Toml.MissingField = c.missingTomlField
+}
+
 func (c *HTTP) getFieldString(tbl *ast.Table, fieldName string, target *string) {
 	if node, ok := tbl.Fields[fieldName]; ok {
 		if kv, ok := node.(*ast.KeyValue); ok {
 			if str, ok := kv.Value.(*ast.String); ok {
 				*target = str.Value
+			}
+		}
+	}
+}
+
+func (c *HTTP) getFieldInt64(tbl *ast.Table, fieldName string, target *int64) {
+	if node, ok := tbl.Fields[fieldName]; ok {
+		if kv, ok := node.(*ast.KeyValue); ok {
+			if iAst, ok := kv.Value.(*ast.Integer); ok {
+				i, err := iAst.Int()
+				if err != nil {
+					c.addError(tbl, fmt.Errorf("unexpected int type %q, expecting int", iAst.Value))
+					return
+				}
+				*target = i
+			} else {
+				c.addError(tbl, fmt.Errorf("found unexpected format while parsing %q, expecting int", fieldName))
 			}
 		}
 	}
@@ -735,37 +821,109 @@ func (h *HTTP) setRequestAuth(request *http.Request) error {
 	return nil
 }
 
-// func (c *HTTP) addAggregator(name string, table *ast.Table) error {
-// 	creator, ok := aggregators.Aggregators[name]
-// 	if !ok {
-// 		// Handle removed, deprecated plugins
-// 		if di, deprecated := aggregators.Deprecations[name]; deprecated {
-// 			printHistoricPluginDeprecationNotice("aggregators", name, di)
-// 			return fmt.Errorf("plugin deprecated")
-// 		}
-// 		return fmt.Errorf("undefined but requested aggregator: %s", name)
-// 	}
-// 	aggregator := creator()
-
-// 	conf, err := c.buildAggregator(name, table)
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	if err := c.toml.UnmarshalTable(table, aggregator); err != nil {
-// 		return err
-// 	}
-
-// 	if err := c.printUserDeprecation("aggregators", name, aggregator); err != nil {
-// 		return err
-// 	}
-
-// 	c.Aggregators = append(c.Aggregators, models.NewRunningAggregator(aggregator, conf))
-// 	return nil
-// }
-
 func (c *HTTP) hasErrs() bool {
 	return len(c.errs) > 0
+}
+
+func (c *HTTP) addError(tbl *ast.Table, err error) {
+	c.errs = append(c.errs, fmt.Errorf("line %d:%d: %w", tbl.Line, tbl.Position, err))
+}
+
+func (e *HTTP) Start(acc telegraf.Accumulator) error {
+	// var err error
+	// e.serializer, err = serializers.NewSerializer(e.serializerConfig)
+	// if err != nil {
+	// 	return fmt.Errorf("error creating serializer: %w", err)
+	// }
+	// e.acc = acc
+
+	// e.process, err = process.New(e.Command, e.Environment)
+	// if err != nil {
+	// 	return fmt.Errorf("error creating new process: %w", err)
+	// }
+	// e.process.Log = e.Log
+	// e.process.RestartDelay = time.Duration(e.RestartDelay)
+	// e.process.ReadStdoutFn = e.cmdReadOut
+	// e.process.ReadStderrFn = e.cmdReadErr
+
+	// if err = e.process.Start(); err != nil {
+	// 	// if there was only one argument, and it contained spaces, warn the user
+	// 	// that they may have configured it wrong.
+	// 	if len(e.Command) == 1 && strings.Contains(e.Command[0], " ") {
+	// 		e.Log.Warn("The processors.execd Command contained spaces but no arguments. " +
+	// 			"This setting expects the program and arguments as an array of strings, " +
+	// 			"not as a space-delimited string. See the plugin readme for an example.")
+	// 	}
+	// 	return fmt.Errorf("failed to start process %s: %w", e.Command, err)
+	// }
+
+	return nil
+}
+
+func (e *HTTP) Add(m telegraf.Metric, _ telegraf.Accumulator) error {
+	// b, err := e.serializer.Serialize(m)
+	// if err != nil {
+	// 	return fmt.Errorf("metric serializing error: %w", err)
+	// }
+
+	// _, err = e.process.Stdin.Write(b)
+	// if err != nil {
+	// 	return fmt.Errorf("error writing to process stdin: %w", err)
+	// }
+
+	// // We cannot maintain tracking metrics at the moment because input/output
+	// // is done asynchronously and we don't have any metric metadata to tie the
+	// // output metric back to the original input metric.
+	// m.Drop()
+	return nil
+}
+
+func (e *HTTP) Stop() {
+	// e.process.Stop()
+}
+
+func (c *HTTP) missingTomlField(_ reflect.Type, key string) error {
+	switch key {
+	// General options to ignore
+	case "alias",
+		"collection_jitter", "collection_offset",
+		"data_format", "delay", "drop", "drop_original",
+		"fielddrop", "fieldpass", "flush_interval", "flush_jitter",
+		"grace",
+		"interval",
+		"lvm", // What is this used for?
+		"metric_batch_size", "metric_buffer_limit",
+		"name_override", "name_prefix", "name_suffix", "namedrop", "namepass",
+		"order",
+		"method", "urls",
+		"pass", "period", "precision",
+		"tagdrop", "tagexclude", "taginclude", "tagpass", "tags":
+
+	// Secret-store options to ignore
+	case "id":
+
+	// Parser options to ignore
+	case "data_type", "influx_parser_type":
+
+	// Serializer options to ignore
+	case "prefix", "template", "templates", "xpath",
+		"carbon2_format", "carbon2_sanitize_replace_char",
+		"csv_column_prefix", "csv_header", "csv_separator", "csv_timestamp_format",
+		"graphite_strict_sanitize_regex",
+		"graphite_tag_sanitize_mode", "graphite_tag_support", "graphite_separator",
+		"influx_max_line_bytes", "influx_sort_fields", "influx_uint_support",
+		"json_timestamp_format", "json_timestamp_units", "json_transformation",
+		"json_nested_fields_include", "json_nested_fields_exclude",
+		"prometheus_export_timestamp", "prometheus_sort_metrics", "prometheus_string_as_label",
+		"prometheus_compact_encoding",
+		"splunkmetric_hec_routing", "splunkmetric_multimetric", "splunkmetric_omit_event_tag",
+		"wavefront_disable_prefix_conversion", "wavefront_source_override", "wavefront_use_strict":
+	default:
+		c.unusedFieldsMutex.Lock()
+		c.UnusedFields[key] = true
+		c.unusedFieldsMutex.Unlock()
+	}
+	return nil
 }
 
 func makeRequestBodyReader(contentEncoding, body string) io.Reader {
@@ -782,11 +940,23 @@ func makeRequestBodyReader(contentEncoding, body string) io.Reader {
 }
 
 func init() {
-	inputs.Add("http", func() telegraf.Input {
+	processors.AddStreaming("http", func() telegraf.StreamingProcessor {
 		return &HTTP{
 			Method: "GET",
+			serializerConfig: &serializers.Config{
+				DataFormat: "influx",
+			},
 		}
 	})
+}
+
+func trimBOM(f []byte) []byte {
+	return bytes.TrimPrefix(f, []byte("\xef\xbb\xbf"))
+}
+
+// escapeEnv escapes a value for inserting into a TOML string.
+func escapeEnv(value string) string {
+	return envVarEscaper.Replace(value)
 }
 
 // unwrappable lets you retrieve the original telegraf.Processor from the

@@ -18,8 +18,14 @@ var (
 )
 
 type Config struct {
+	Setting configLog    `toml:"config"`
+	Cfg     cfgHTTP.HTTP `toml:"processors.http"`
+}
+
+type CfgFile struct {
 	// Cfg ConfigMain `toml:"config"`
-	Cfg cfgHTTP.HTTP `toml:"config"`
+	Setting configLog    `toml:"config"`
+	Cfg     cfgHTTP.HTTP `toml:"processors.http"`
 }
 
 //type ConfigMain struct {
@@ -57,12 +63,11 @@ type Config struct {
 //	parserFunc telegraf.ParserFunc
 //}
 
-type configItem struct {
-	ID             string            `toml:"id"`
-	SqlTemplate    string            `toml:"sql_template"`
-	Tags           []string          `toml:"tag_columns"`
-	ExcludeColumns []string          `toml:"exclude_columns"`
-	ColumnTypes    map[string]string `toml:"column_types"`
+type configLog struct {
+	LogFilePath      string `toml:"logfile_path"`
+	LogFileMaxSize   int    `toml:"logfile_maxsize"`
+	LogFileMaxBackup int    `toml:"logfile_maxbackup"`
+	LogFileMaxAge    int    `toml:"logfile_maxage"`
 }
 
 func NewConfig() *Config {
@@ -80,6 +85,12 @@ func (c *Config) LoadConfig(path string) error {
 	s := expandEnvVars(b)
 
 	_, err = toml.Decode(s, c)
+	if err != nil {
+		return err
+	}
+
+	var cfg2 CfgFile
+	err = toml.Unmarshal([]byte(s), &cfg2)
 	if err != nil {
 		return err
 	}
