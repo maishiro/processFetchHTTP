@@ -31,22 +31,35 @@ func main() {
 	flag.Parse()
 	strPathConfig := *pszPathConfig
 
+	// LOG configuration
+	cLog, err := config.LoadConfigLog(strPathConfig)
+	if err != nil {
+		log.Printf("Failed to load log config file: %v\n", err)
+		return
+	}
+	log.SetOutput(&lumberjack.Logger{
+		Filename:   cLog.Setting.LogFilePath,
+		MaxSize:    cLog.Setting.LogFileMaxSize,
+		MaxBackups: cLog.Setting.LogFileMaxBackup,
+		MaxAge:     cLog.Setting.LogFileMaxAge,
+		Compress:   false,
+	})
+
 	// load configuration
 	cfg := config.NewConfig()
-	err := cfg.LoadConfig(strPathConfig)
+	err = cfg.LoadConfig(strPathConfig)
 	if err != nil {
 		log.Printf("Failed to load config file: %v\n", err)
 		return
 	}
 
-	// LOG configuration
-	log.SetOutput(&lumberjack.Logger{
-		Filename:   cfg.Setting.LogFilePath,
-		MaxSize:    cfg.Setting.LogFileMaxSize,
-		MaxBackups: cfg.Setting.LogFileMaxBackup,
-		MaxAge:     cfg.Setting.LogFileMaxAge,
-		Compress:   false,
-	})
+	if p, ok := cfg.Inputs[0].Input.(telegraf.Initializer); ok {
+		err := p.Init()
+		if err != nil {
+			log.Printf("Failed to Init(): %v\n", err)
+			return
+		}
+	}
 
 	// if len(cfg.Cfg.Items) == 0 {
 	// 	log.Println("Nothing observe item")
@@ -70,10 +83,6 @@ func main() {
 		// })
 
 		for {
-			metrics := make(chan telegraf.Metric, 10)
-			defer close(metrics)
-			acc := agent.NewAccumulator(&TestMetricMaker{}, metrics)
-
 			var sc = bufio.NewScanner(os.Stdin)
 			if sc.Scan() {
 				line := sc.Text()
@@ -100,7 +109,16 @@ func main() {
 					vv = append(vv, fmt.Sprintf("%v", v.Value))
 				}
 
-				err = cfg.Cfg.Gather(acc)
+				metrics := make(chan telegraf.Metric, 10)
+				defer close(metrics)
+				acc := agent.NewAccumulator(&TestMetricMaker{}, metrics)
+
+				cc := cfg.Inputs[0].Input
+				err = cc.Gather(acc)
+				if err != nil {
+					log.Printf("Failed to Gather(): %v\n", err)
+					return
+				}
 
 				// driverName := cfg.Cfg.Driver
 				// connStr := cfg.Cfg.ConnectionString
