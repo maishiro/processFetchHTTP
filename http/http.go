@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -13,11 +14,11 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
-	"github.com/influxdata/toml"
 
+	// "github.com/influxdata/telegraf/internal"
 	httpconfig "github.com/influxdata/telegraf/plugins/common/http"
-	_ "github.com/influxdata/telegraf/plugins/parsers/xpath"
 	"github.com/influxdata/telegraf/plugins/inputs"
+	_ "github.com/influxdata/telegraf/plugins/parsers/xpath"
 	"github.com/influxdata/telegraf/plugins/serializers"
 )
 
@@ -41,18 +42,11 @@ type HTTP struct {
 
 	SuccessStatusCodes []int `toml:"success_status_codes"`
 
-	DataFormat string `toml:"data_format"`
-
 	Log telegraf.Logger `toml:"-"`
-	Toml              *toml.Config
-	errs              []error // config load errors.
 
 	httpconfig.HTTPClientConfig
-	serializerConfig *serializers.Config
-	serializer       serializers.Serializer
 
 	client     *http.Client
-	parser     telegraf.Parser
 	parserFunc telegraf.ParserFunc
 }
 
@@ -68,13 +62,6 @@ func (h *HTTP) Init() error {
 	}
 
 	h.client = client
-
-	tomlCfg := &toml.Config{
-		NormFieldName: toml.DefaultConfig.NormFieldName,
-		FieldToKey:    toml.DefaultConfig.FieldToKey,
-		// MissingField:  h.missingTomlField,
-	}
-	h.Toml = tomlCfg
 
 	// Set default as [200]
 	if len(h.SuccessStatusCodes) == 0 {
@@ -105,10 +92,6 @@ func (h *HTTP) Gather(acc telegraf.Accumulator) error {
 // SetParserFunc takes the data_format from the config and finds the right parser for that format
 func (h *HTTP) SetParserFunc(fn telegraf.ParserFunc) {
 	h.parserFunc = fn
-}
-
-func (e *HTTP) SetParser(p telegraf.Parser) {
-	e.parser = p
 }
 
 // Gathers data from a particular URL
@@ -198,6 +181,22 @@ func (h *HTTP) gatherURL(
 		acc.AddFields(metric.Name(), metric.Fields(), metric.Tags(), metric.Time())
 	}
 
+	// influx テキスト出力する
+	serializer := serializers.NewInfluxSerializer()
+	for _, metric := range metrics {
+		if !metric.HasTag("url") {
+			metric.AddTag("url", url)
+		}
+		b, err := serializer.Serialize(metric)
+		if err != nil {
+			log.Printf("ERR %v\n", err)
+			continue
+		}
+		outline := string(b)
+		log.Printf("output %s\n", outline)
+		fmt.Fprint(os.Stdout, outline)
+	}
+
 	return nil
 }
 
@@ -223,59 +222,6 @@ func (h *HTTP) setRequestAuth(request *http.Request) error {
 	return nil
 }
 
-func (e *HTTP) Start(acc telegraf.Accumulator) error {
-	// var err error
-	// e.serializer, err = serializers.NewSerializer(e.serializerConfig)
-	// if err != nil {
-	// 	return fmt.Errorf("error creating serializer: %w", err)
-	// }
-	// e.acc = acc
-
-	// e.process, err = process.New(e.Command, e.Environment)
-	// if err != nil {
-	// 	return fmt.Errorf("error creating new process: %w", err)
-	// }
-	// e.process.Log = e.Log
-	// e.process.RestartDelay = time.Duration(e.RestartDelay)
-	// e.process.ReadStdoutFn = e.cmdReadOut
-	// e.process.ReadStderrFn = e.cmdReadErr
-
-	// if err = e.process.Start(); err != nil {
-	// 	// if there was only one argument, and it contained spaces, warn the user
-	// 	// that they may have configured it wrong.
-	// 	if len(e.Command) == 1 && strings.Contains(e.Command[0], " ") {
-	// 		e.Log.Warn("The processors.execd Command contained spaces but no arguments. " +
-	// 			"This setting expects the program and arguments as an array of strings, " +
-	// 			"not as a space-delimited string. See the plugin readme for an example.")
-	// 	}
-	// 	return fmt.Errorf("failed to start process %s: %w", e.Command, err)
-	// }
-
-	return nil
-}
-
-func (e *HTTP) Add(m telegraf.Metric, _ telegraf.Accumulator) error {
-	// b, err := e.serializer.Serialize(m)
-	// if err != nil {
-	// 	return fmt.Errorf("metric serializing error: %w", err)
-	// }
-
-	// _, err = e.process.Stdin.Write(b)
-	// if err != nil {
-	// 	return fmt.Errorf("error writing to process stdin: %w", err)
-	// }
-
-	// // We cannot maintain tracking metrics at the moment because input/output
-	// // is done asynchronously and we don't have any metric metadata to tie the
-	// // output metric back to the original input metric.
-	// m.Drop()
-	return nil
-}
-
-func (e *HTTP) Stop() {
-	// e.process.Stop()
-}
-
 func makeRequestBodyReader(contentEncoding, body string) io.Reader {
 	if body == "" {
 		return nil
@@ -293,9 +239,6 @@ func init() {
 	inputs.Add("http", func() telegraf.Input {
 		return &HTTP{
 			Method: "GET",
-			serializerConfig: &serializers.Config{
-				DataFormat: "influx",
-			},
 		}
 	})
 }
