@@ -15,7 +15,6 @@ type keyValuePair struct {
 }
 
 func processTable(parent string, table *ast.Table) ([]keyValuePair, error) {
-
 	var prefix string
 	var options []keyValuePair
 

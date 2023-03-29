@@ -20,6 +20,7 @@ import (
 	"github.com/influxdata/toml/ast"
 
 	"github.com/influxdata/telegraf"
+	// "github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/models"
 	"github.com/influxdata/telegraf/persister"
 	"github.com/influxdata/telegraf/plugins/inputs"
@@ -28,7 +29,7 @@ import (
 	"github.com/influxdata/telegraf/plugins/parsers/csv"
 	"github.com/influxdata/telegraf/plugins/processors"
 
-	//"github.com/influxdata/telegraf/plugins/secretstores"
+	// "github.com/influxdata/telegraf/plugins/secretstores"
 	"github.com/influxdata/telegraf/plugins/serializers"
 
 	cfgHTTP "processFetchHTTP/HTTP"
@@ -89,45 +90,8 @@ type OrderedPlugin struct {
 type OrderedPlugins []*OrderedPlugin
 
 type CfgFile struct {
-	// Cfg ConfigMain `toml:"config"`
 	Setting configLog `toml:"config"`
-	// Cfg     cfgHTTP.HTTP `toml:"-"`
 }
-
-//type ConfigMain struct {
-//	LogFilePath      string `toml:"logfile_path"`
-//	LogFileMaxSize   int    `toml:"logfile_maxsize"`
-//	LogFileMaxBackup int    `toml:"logfile_maxbackup"`
-//	LogFileMaxAge    int    `toml:"logfile_maxage"`
-//
-//	// Driver           string `toml:"driver"`
-//	// ConnectionString string `toml:"connection_string"`
-//
-//	// Items []configItem `toml:"item"`
-//
-//	URLs            []string `toml:"urls"`
-//	Method          string   `toml:"method"`
-//	Body            string   `toml:"body"`
-//	ContentEncoding string   `toml:"content_encoding"`
-//
-//	Headers map[string]string `toml:"headers"`
-//
-//	// HTTP Basic Auth Credentials
-//	// Username config.Secret `toml:"username"`
-//	// Password config.Secret `toml:"password"`
-//
-//	// Absolute path to file with Bearer token
-//	BearerToken string `toml:"bearer_token"`
-//
-//	SuccessStatusCodes []int `toml:"success_status_codes"`
-//
-//	Log telegraf.Logger `toml:"-"`
-//
-//	httpconfig.HTTPClientConfig
-//
-//	client     *http.Client
-//	parserFunc telegraf.ParserFunc
-//}
 
 type configLog struct {
 	LogFilePath      string `toml:"logfile_path"`
@@ -176,7 +140,7 @@ type AgentConfig struct {
 
 	// Collected metrics are rounded to the precision specified. Precision is
 	// specified as an interval with an integer + unit (e.g. 0s, 10ms, 2us, 4s).
-	// Valid time units are "ns", "us" (or "��s"), "ms", "s".
+	// Valid time units are "ns", "us" (or "µs"), "ms", "s".
 	//
 	// By default, or when set to "0s", precision will be set to the same
 	// timestamp order as the collection interval, with the maximum being 1s:
@@ -310,24 +274,7 @@ func (c *Config) LoadConfig(path string) error {
 		return fmt.Errorf("error loading config file %s: %w", path, err)
 	}
 
-	// _, err = tomlb.Decode(s, c)
-	// if err != nil {
-	// 	return err
-	// }
-
-	// var cfg2 CfgFile
-	// err = toml.Unmarshal([]byte(s), &cfg2)
-	// if err != nil {
-	// 	return err
-	// }
-
 	c.Cfg.Init()
-
-	// err = c.LoadConfigData(b)
-	// if err != nil {
-	// 	// return fmt.Errorf("error parsing data: %w", err)
-	// 	return err
-	// }
 
 	return nil
 }
@@ -694,11 +641,6 @@ func (c *Config) addProcessor(name string, table *ast.Table) error {
 		return fmt.Errorf("undefined but requested processor: %s", name)
 	}
 
-	var method string
-	c.getFieldString(table, "method", &method)
-	var body string
-	c.getFieldString(table, "body", &body)
-
 	// For processors with parsers we need to compute the set of
 	// options that is not covered by both, the parser and the processor.
 	// We achieve this by keeping a local book of missing entries
@@ -789,8 +731,7 @@ func (c *Config) setupProcessor(name string, creator processors.StreamingCreator
 	}
 
 	// err := c.printUserDeprecation("processors", name, processor)
-	var err error
-	err = nil
+	var err error = nil
 	return streamingProcessor, hasParser, err
 }
 
@@ -1208,7 +1149,6 @@ func (c *Config) missingTomlField(_ reflect.Type, key string) error {
 		"metric_batch_size", "metric_buffer_limit",
 		"name_override", "name_prefix", "name_suffix", "namedrop", "namepass",
 		"order",
-		"method", "urls",
 		"pass", "period", "precision",
 		"tagdrop", "tagexclude", "taginclude", "tagpass", "tags":
 
@@ -1220,7 +1160,6 @@ func (c *Config) missingTomlField(_ reflect.Type, key string) error {
 
 	// Serializer options to ignore
 	case "prefix", "template", "templates",
-		"xpath",
 		"carbon2_format", "carbon2_sanitize_replace_char",
 		"csv_column_prefix", "csv_header", "csv_separator", "csv_timestamp_format",
 		"graphite_strict_sanitize_regex",
